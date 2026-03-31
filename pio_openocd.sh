@@ -13,7 +13,7 @@ BOOTSTRAP_BIN="$BOOTSTRAP_DIR/bin/openocd"
 BOOTSTRAP_SCRIPTS_DIR="$BOOTSTRAP_DIR/openocd/scripts"
 PIO_CORE_DIR="${PLATFORMIO_CORE_DIR:-$HOME/.platformio}"
 
-XPACK_VERSION="${OPENOCD_XPACK_VERSION:-0.12.0-4}"
+XPACK_VERSION="${OPENOCD_XPACK_VERSION:-0.12.0-7}"
 
 log() {
     echo "[pio_openocd] $*" >&2
@@ -53,7 +53,7 @@ has_stm32c0_support() {
     [ -f "$scripts_dir/target/swj-dp.tcl" ] || return 1
     [ -f "$scripts_dir/mem_helper.tcl" ] || return 1
 
-    if strings "$bin" | grep -Eq 'STM32C0|STM32C09|STM32C01|STM32C03|STM32C05|STM32C071'; then
+    if grep -aEq 'STM32C0|STM32C09|STM32C01|STM32C03|STM32C05|STM32C071' "$bin"; then
         return 0
     fi
 
