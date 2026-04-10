@@ -12,6 +12,8 @@ namespace Pins
   constexpr uint8_t RED_LED = PA0;
   constexpr uint8_t GREEN_LED = PA1;
   constexpr uint8_t BLUE_LED = PA2;
+  constexpr uint8_t I2C_SDA = PA6;
+  constexpr uint8_t I2C_SCL = PA7;
 }
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -25,6 +27,10 @@ namespace Config
   constexpr TickType_t LED_PERIOD_MS = 20;
   constexpr TickType_t CHARGER_POLL_PERIOD_MS = 300;
 
+  // I2C task watchdog
+  constexpr TickType_t I2C_WATCHDOG_CHECK_MS = 2000;
+  constexpr TickType_t I2C_WATCHDOG_TIMEOUT_MS = 3000;
+
   // LED animation
   constexpr uint32_t STATUS_LED_BLINK_MS = 300;
   constexpr uint32_t BREATHING_CYCLE_MS = 3000;
@@ -32,7 +38,7 @@ namespace Config
 
   // Task stack sizes (in words, not bytes — multiply by 4 for bytes)
   constexpr uint16_t LED_TASK_STACK = 256;
-  constexpr uint16_t CHARGER_TASK_STACK = 256;
+  constexpr uint16_t CHARGER_TASK_STACK = 320;
 }
 
 // ─── Shared State ────────────────────────────────────────────────────────────
@@ -52,10 +58,59 @@ struct ChargerStatus
 static SemaphoreHandle_t statusMutex = nullptr;
 static ChargerStatus sharedStatus;
 
+// ─── I2C Watchdog State ──────────────────────────────────────────────────────
+//
+// The watchdog timer runs in the FreeRTOS timer daemon context.
+// It monitors lastChargerPetTick to detect a stuck charger task.
+
+static TaskHandle_t chargerTaskHandle = nullptr;
+static TimerHandle_t i2cWatchdogTimer = nullptr;
+static volatile TickType_t lastChargerPetTick = 0;
+static volatile TickType_t i2cRecoveryTick = 0;
+static volatile bool chargerTaskNeedsReinit = false;
+
 // ─── Hardware ────────────────────────────────────────────────────────────────
 
-TwoWire I2C2_Bus(PA6, PA7);
+TwoWire I2C2_Bus(Pins::I2C_SDA, Pins::I2C_SCL);
 BQ25756 charger(I2C2_Bus, Config::CHARGER_I2C_ADDRESS);
+
+// ─── Independent Watchdog (IWDG) ─────────────────────────────────────────────
+//
+// Hardware watchdog driven by the LSI oscillator (≈32 kHz).
+// Completely independent of CPU, interrupts, and FreeRTOS.
+// If the charger task can't pet within ~4s, the MCU resets.
+
+/// Pet the hardware watchdog. Must be called regularly.
+static inline void iwdgPet()
+{
+  IWDG->KR = 0xAAAA;
+}
+
+/// Start the IWDG with approximately 4-second timeout.
+/// Once started, the IWDG cannot be stopped — only a reset clears it.
+static void iwdgStart()
+{
+  IWDG->KR  = 0xCCCC;  // Start IWDG (this automatically enables the LSI clock)
+  IWDG->KR  = 0x5555;  // Enable register write access
+  IWDG->PR  = 4;       // Prescaler /64 (LSI ≈32kHz → 500Hz)
+  IWDG->RLR = 2000;    // Reload: 2000/500 = 4 second timeout
+  while (IWDG->SR != 0) {} // Wait for registers to update
+  IWDG->KR  = 0xAAAA;  // Initial pet
+}
+
+/// Log the cause of the last reset (useful to confirm IWDG recovery).
+static void logResetCause()
+{
+  uint32_t csr = RCC->CSR2;
+  if (csr & RCC_CSR2_IWDGRSTF)
+    Serial.println("BOOT: Reset by IWDG (I2C lockup auto-recovery)");
+  else if (csr & RCC_CSR2_SFTRSTF)
+    Serial.println("BOOT: Software reset");
+  else if (csr & RCC_CSR2_PINRSTF)
+    Serial.println("BOOT: Pin reset (NRST)");
+  // Clear reset flags for next boot
+  RCC->CSR2 |= RCC_CSR2_RMVF;
+}
 
 // ─── LED Helpers ─────────────────────────────────────────────────────────────
 
@@ -83,6 +138,9 @@ static void updateStatusLed(const ChargerStatus &status)
 
   // PRIORITY 1: Fault Condition — LED Blink Code Diagnostic
   // Protocol: Long CYAN pulse (start), followed by N RED blinks (bit position in Reg 0x24)
+  // PRIORITY 1: Fault Condition — LED Blink Code Diagnostic
+  // [DISABLED per user request]
+  /*
   if (status.faultCode != 0)
   {
     // Total cycle: 6 seconds
@@ -131,6 +189,7 @@ static void updateStatusLed(const ChargerStatus &status)
     }
     return;
   }
+  */
 
   // PRIORITY 1.5: Watchdog Reset — amber triple-flash (sticky until reboot)
   if (status.watchdogTriggered)
@@ -146,6 +205,22 @@ static void updateStatusLed(const ChargerStatus &status)
     else
       setLedRGB(0, 0, 0);
     return;
+  }
+
+  // PRIORITY 1.75: I2C bus recovery — magenta double-flash (10s after recovery)
+  if (i2cRecoveryTick != 0)
+  {
+    TickType_t recoveryAge = xTaskGetTickCount() - i2cRecoveryTick;
+    if (recoveryAge < pdMS_TO_TICKS(10000))
+    {
+      const uint32_t t = now % 2000;
+      bool isOn = (t < 100) || (t >= 200 && t < 300);
+      if (isOn)
+        setLedRGB(255, 0, 255); // Magenta
+      else
+        setLedRGB(0, 0, 0);
+      return;
+    }
   }
 
   // PRIORITY 2: No input power — soft white breathing
@@ -224,11 +299,122 @@ static void statusLedTask(void *pvParameters)
   }
 }
 
-/// Lower-priority task: polls the BQ25756 over I2C every 100ms.
+// ─── I2C Bus Recovery ────────────────────────────────────────────────────────
+
+// Forward declaration
+static void chargerMonitorTask(void *pvParameters);
+
+/// Bit-bang the I2C bus lines to recover from a stuck slave.
+/// Generates 9 SCL clock pulses and a STOP condition, with SDA force-release.
+static void i2cBusRecover()
+{
+  // After Wire::end(), pins are in analog mode — reconfigure as GPIO
+  pinMode(Pins::I2C_SCL, OUTPUT);
+  pinMode(Pins::I2C_SDA, INPUT_PULLUP);
+
+  // Generate up to 9 SCL clock pulses to free a stuck slave
+  for (int i = 0; i < 9; i++)
+  {
+    digitalWrite(Pins::I2C_SCL, LOW);
+    delayMicroseconds(10);
+    digitalWrite(Pins::I2C_SCL, HIGH);
+    delayMicroseconds(10);
+    if (digitalRead(Pins::I2C_SDA) == HIGH)
+      break;
+  }
+
+  // Generate STOP condition: SDA low→high while SCL is high
+  pinMode(Pins::I2C_SDA, OUTPUT);
+  digitalWrite(Pins::I2C_SDA, LOW);
+  delayMicroseconds(10);
+  digitalWrite(Pins::I2C_SCL, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(Pins::I2C_SDA, HIGH); // STOP
+  delayMicroseconds(10);
+
+  // If SDA is still stuck low, force it high as last resort
+  pinMode(Pins::I2C_SDA, INPUT_PULLUP);
+  delayMicroseconds(10);
+  if (digitalRead(Pins::I2C_SDA) == LOW)
+  {
+    pinMode(Pins::I2C_SDA, OUTPUT);
+    digitalWrite(Pins::I2C_SDA, HIGH);
+    delayMicroseconds(50);
+  }
+
+  // Release pins (Wire::begin will reconfigure for I2C)
+  pinMode(Pins::I2C_SCL, INPUT);
+  pinMode(Pins::I2C_SDA, INPUT);
+}
+
+/// Helper to create the charger monitor task (used at boot and after recovery).
+static BaseType_t createChargerTask()
+{
+  return xTaskCreate(chargerMonitorTask, "CHG", Config::CHARGER_TASK_STACK,
+                     nullptr, 1, &chargerTaskHandle);
+}
+
+/// FreeRTOS timer callback — supervises the charger task.
+/// If the task hasn't petted within the timeout, perform hard I2C reset
+/// and recreate the task.
+static void i2cWatchdogCallback(TimerHandle_t xTimer)
+{
+  (void)xTimer;
+
+  TickType_t elapsed = xTaskGetTickCount() - lastChargerPetTick;
+  if (elapsed < pdMS_TO_TICKS(Config::I2C_WATCHDOG_TIMEOUT_MS))
+    return; // Task is alive
+
+  Serial.println("I2C WATCHDOG: Charger task stuck! Recovering...");
+
+  // 1. Delete the stuck task
+  if (chargerTaskHandle != nullptr)
+  {
+    vTaskDelete(chargerTaskHandle);
+    chargerTaskHandle = nullptr;
+  }
+
+  // 2. Tear down the I2C peripheral
+  I2C2_Bus.end();
+
+  // 3. Bit-bang bus recovery (SCL pulses + SDA manipulation)
+  i2cBusRecover();
+
+  // 4. Flag the recreated task to re-init I2C
+  chargerTaskNeedsReinit = true;
+  i2cRecoveryTick = xTaskGetTickCount();
+
+  // 5. Recreate the charger task
+  if (createChargerTask() == pdPASS)
+    Serial.println("I2C WATCHDOG: Charger task restarted.");
+  else
+    Serial.println("I2C WATCHDOG: Failed to recreate task!");
+}
+
+// ─── FreeRTOS Tasks ──────────────────────────────────────────────────────────
+
+/// Lower-priority task: polls the BQ25756 over I2C every 300ms.
 /// Writes results into the shared status struct under the mutex.
 static void chargerMonitorTask(void *pvParameters)
 {
   (void)pvParameters;
+
+  // Pet immediately to prevent false watchdog trigger during init
+  lastChargerPetTick = xTaskGetTickCount();
+
+  // Re-initialize I2C if recovering from a bus lockup
+  if (chargerTaskNeedsReinit)
+  {
+    Serial.println("CHG: Re-initializing I2C after recovery...");
+    while (!charger.begin(Config::I2C_CLOCK_HZ, true))
+    {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      lastChargerPetTick = xTaskGetTickCount();
+      iwdgPet(); // Keep hardware watchdog alive during retry
+    }
+    chargerTaskNeedsReinit = false;
+    Serial.println("CHG: I2C re-initialized.");
+  }
 
   // Initialize charger to wake up REGN
   // 1. Disable hardware /CE pin requirement (ignore what's on the pin)
@@ -244,6 +430,9 @@ static void chargerMonitorTask(void *pvParameters)
 
   for (;;)
   {
+    // Pet both watchdogs at the top of each iteration
+    lastChargerPetTick = xTaskGetTickCount();
+    iwdgPet();
     // Detect watchdog reset: ADC_EN (0x2B bit 7) resets to 0 on timeout.
     // We set it to 1 at init, so if it reads 0 the watchdog must have fired.
     uint8_t adcCtrl = 0;
@@ -295,6 +484,9 @@ static void chargerMonitorTask(void *pvParameters)
       }
     }
 
+    // Mask the TS_FAULT (bit 4) per user request to ignore the '4 red flash' error
+    fault &= ~(1 << 4);
+
     if (xSemaphoreTake(statusMutex, pdMS_TO_TICKS(10)) == pdTRUE)
     {
       sharedStatus.chargeState = chargeState;
@@ -325,7 +517,12 @@ void setup()
   // ── Serial init ──
   Serial.begin(115200);
   delay(100);
+  logResetCause();
   Serial.println("--- BQ25756 Charger Firmware Initializing ---");
+
+  // Start the hardware watchdog (IWDG) immediately to protect boot
+  // We must pet it during wait loops!
+  iwdgStart();
 
   // ── GPIO init ──
   pinMode(Pins::RED_LED, OUTPUT);
@@ -335,9 +532,10 @@ void setup()
   digitalWrite(Pins::GREEN_LED, LOW);
   digitalWrite(Pins::BLUE_LED, LOW);
 
-  // ── Wait for charger IC (blocking — acceptable at boot) ──
+  // ── Wait for charger IC ──
   while (!charger.begin(Config::I2C_CLOCK_HZ, true))
   {
+    iwdgPet();
     digitalWrite(Pins::RED_LED, HIGH);
     delay(500);
     digitalWrite(Pins::RED_LED, LOW);
@@ -347,6 +545,7 @@ void setup()
   // Boot success indicator: 3 quick green flashes
   for (int i = 0; i < 3; i++)
   {
+    iwdgPet();
     digitalWrite(Pins::GREEN_LED, HIGH);
     delay(50);
     digitalWrite(Pins::GREEN_LED, LOW);
@@ -369,35 +568,8 @@ void setup()
   charger.writeRegister8(0x2C, 0x00); // disable VFB ADC Control recommended by datasheet
 
   charger.writeRegister8(0x1A, 0x00); // disable mppt tracking
-
   charger.writeRegister8(0x02, 0x3C0); // set higher current limit
-
-  // charger.writeRegister8()
-
-  // uint8_t faultStatus = 0;
-  // charger.readRegister8(0x24, faultStatus);
-
-  // uint8_t chargeStatus1 = 0;
-  // charger.readRegister8(0x21, chargeStatus1);
-  // uint8_t chargeStatus2 = 0;
-  // charger.readRegister8(0x22, chargeStatus2);
-  // uint8_t chargeStatus3 = 0;
-  // charger.readRegister8(0x23, chargeStatus3);
-
-  // uint16_t inputVoltage = 0;
-  // charger.readRegister16(0x31, inputVoltage, true);
-
-  // uint16_t batteryVoltage = 0;
-  // charger.readRegister16(0x33, batteryVoltage, true);
-
-  // uint16_t chargeCurrent = 0;
-  // charger.readRegister16(0x2F, chargeCurrent, true);
-
-  uint8_t regRead[0x62];
-  for (uint8_t reg = 0; reg <= 0x61; reg++)
-  {
-    charger.readRegister8(reg, regRead[reg]);
-  }
+  iwdgPet();
 
   // ── Create RTOS primitives ──
   statusMutex = xSemaphoreCreateMutex();
@@ -406,9 +578,16 @@ void setup()
   // and vTaskStartScheduler(). No interrupt-dependent code here.
 
   BaseType_t ledCreated = xTaskCreate(statusLedTask, "LED", Config::LED_TASK_STACK, nullptr, 2, nullptr);
-  BaseType_t chgCreated = xTaskCreate(chargerMonitorTask, "CHG", Config::CHARGER_TASK_STACK, nullptr, 1, nullptr);
+  BaseType_t chgCreated = createChargerTask();
 
-  if (statusMutex == nullptr || ledCreated != pdPASS || chgCreated != pdPASS)
+  // Create the I2C watchdog timer (auto-reload, checks every 2s)
+  i2cWatchdogTimer = xTimerCreate("I2CWD",
+                                   pdMS_TO_TICKS(Config::I2C_WATCHDOG_CHECK_MS),
+                                   pdTRUE, nullptr,
+                                   i2cWatchdogCallback);
+
+  if (statusMutex == nullptr || ledCreated != pdPASS || chgCreated != pdPASS
+      || i2cWatchdogTimer == nullptr)
   {
     // RTOS resource allocation failed — fast red/blue alternating blink
     for (;;)
@@ -421,6 +600,11 @@ void setup()
       delay(100);
     }
   }
+
+  // Start the I2C software watchdog (queued, processed after scheduler starts)
+  xTimerStart(i2cWatchdogTimer, 0);
+
+  iwdgPet();
 
   // Start the scheduler — this never returns on success
   vTaskStartScheduler();
