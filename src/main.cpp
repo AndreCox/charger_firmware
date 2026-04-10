@@ -366,21 +366,32 @@ void setup()
   uint8_t writeData = 0xA0;
   charger.writeRegister8(0x2B, writeData);
 
-  uint8_t faultStatus = 0;
-  charger.readRegister8(0x24, faultStatus);
+  charger.writeRegister8(0x2C, 0x00); // disable VFB ADC Control recommended by datasheet
 
-  uint8_t chargeStatus1 = 0;
-  charger.readRegister8(0x21, chargeStatus1);
-  uint8_t chargeStatus2 = 0;
-  charger.readRegister8(0x22, chargeStatus2);
-  uint8_t chargeStatus3 = 0;
-  charger.readRegister8(0x23, chargeStatus3);
+  charger.writeRegister8(0x1A, 0x00); // disable mppt tracking
 
-  uint16_t inputVoltage = 0;
-  charger.readRegister16(0x31, inputVoltage, true);
+  charger.writeRegister8(0x02, 0x3C0); // set higher current limit
 
-  uint16_t batteryVoltage = 0;
-  charger.readRegister16(0x33, batteryVoltage, true);
+  // charger.writeRegister8()
+
+  // uint8_t faultStatus = 0;
+  // charger.readRegister8(0x24, faultStatus);
+
+  // uint8_t chargeStatus1 = 0;
+  // charger.readRegister8(0x21, chargeStatus1);
+  // uint8_t chargeStatus2 = 0;
+  // charger.readRegister8(0x22, chargeStatus2);
+  // uint8_t chargeStatus3 = 0;
+  // charger.readRegister8(0x23, chargeStatus3);
+
+  // uint16_t inputVoltage = 0;
+  // charger.readRegister16(0x31, inputVoltage, true);
+
+  // uint16_t batteryVoltage = 0;
+  // charger.readRegister16(0x33, batteryVoltage, true);
+
+  // uint16_t chargeCurrent = 0;
+  // charger.readRegister16(0x2F, chargeCurrent, true);
 
   uint8_t regRead[0x62];
   for (uint8_t reg = 0; reg <= 0x61; reg++)
